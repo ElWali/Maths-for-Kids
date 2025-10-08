@@ -101,6 +101,13 @@
                     maxZoom: 18,
                     tileUrl: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
                     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                    // UX Configuration
+                    inertia: true,
+                    inertiaDeceleration: 0.95,
+                    doubleClickZoom: true,
+                    zoomAnimationDuration: 300,
+                    wheelDebounce: 40,
+                    panThreshold: 5, // The minimum number of pixels a user must pan before it is considered a drag.
                     ...options
                 };
 
@@ -113,6 +120,15 @@
 
                 // Marker management
                 this._markers = [];
+
+                // Animation state
+                this._transform = { x: 0, y: 0, scale: 1 };
+                this._animationFrameId = null;
+
+                // Tap detection state
+                this._lastTapTime = 0;
+                this._tapTimeout = null;
+                this._wheelDebounceTimeout = null;
 
                 // --- Initialization ---
                 this._initLayout();
@@ -128,16 +144,26 @@
                 this._container.style.position = this._container.style.position || 'relative';
                 this._container.style.cursor = 'grab';
 
-                // Create canvas for rendering map tiles
+                // Create the transform pane for panning and zooming animations
+                this._transformPane = document.createElement('div');
+                this._transformPane.style.position = 'absolute';
+                this._transformPane.style.width = '100%';
+                this._transformPane.style.height = '100%';
+                this._transformPane.style.zIndex = '1';
+                // Use will-change to hint to the browser about upcoming transformations
+                this._transformPane.style.willChange = 'transform';
+                this._container.appendChild(this._transformPane);
+
+                // Create canvas for rendering map tiles, now inside the transform pane
                 this._canvas = document.createElement('canvas');
                 this._canvas.style.position = 'absolute';
                 this._canvas.style.top = '0';
                 this._canvas.style.left = '0';
                 this._canvas.style.zIndex = '1';
-                this._container.appendChild(this._canvas);
+                this._transformPane.appendChild(this._canvas);
                 this._ctx = this._canvas.getContext('2d');
 
-                // Create SVG layer for markers and other vector overlays
+                // Create SVG layer for markers, also inside the transform pane
                 this._svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
                 this._svg.style.position = 'absolute';
                 this._svg.style.top = '0';
@@ -145,9 +171,8 @@
                 this._svg.style.width = '100%';
                 this._svg.style.height = '100%';
                 this._svg.style.zIndex = '2';
-                // Let pointer events (like clicks and drags) pass through to the container/canvas
                 this._svg.style.pointerEvents = 'none';
-                this._container.appendChild(this._svg);
+                this._transformPane.appendChild(this._svg);
 
                 // A dedicated SVG group for markers to keep them organized
                 this._markerPane = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -181,8 +206,10 @@
                 zoomInButton.className = 'atlas-zoom-button';
                 zoomInButton.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 3v7m-3.5-3.5h7" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>';
                 zoomInButton.onclick = (e) => {
-                    e.stopPropagation(); // Prevent map click event
-                    this.setZoom(this._zoom + 1);
+                    e.stopPropagation();
+                    const centerPoint = { x: this._width / 2, y: this._height / 2 };
+                    const currentZoom = this._zoom + Math.log2(this._transform.scale);
+                    this._animateZoom(Math.round(currentZoom) + 1, centerPoint);
                 };
                 controlsContainer.appendChild(zoomInButton);
 
@@ -191,8 +218,10 @@
                 zoomOutButton.className = 'atlas-zoom-button';
                 zoomOutButton.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20"><path d="M6.5 10h7" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>';
                 zoomOutButton.onclick = (e) => {
-                    e.stopPropagation(); // Prevent map click event
-                    this.setZoom(this._zoom - 1);
+                    e.stopPropagation();
+                    const centerPoint = { x: this._width / 2, y: this._height / 2 };
+                    const currentZoom = this._zoom + Math.log2(this._transform.scale);
+                    this._animateZoom(Math.round(currentZoom) - 1, centerPoint);
                 };
                 controlsContainer.appendChild(zoomOutButton);
 
@@ -222,123 +251,139 @@
 
                 // Mouse wheel zoom
                 this._container.addEventListener('wheel', (e) => this._onWheel(e));
-
-                // Double-click zoom
-                this._container.addEventListener('dblclick', (e) => this._onDblClick(e));
             }
 
             // --- Interaction Handlers ---
 
-            /** Handles mouse wheel zooming. */
+            /** Handles mouse wheel zooming with smooth, cursor-centered interaction. */
             _onWheel(e) {
                 e.preventDefault();
+                this._commitInteraction(); // Commit any pending interactions
 
-                const delta = e.deltaY > 0 ? -1 : 1;
-                const newZoom = this._zoom + delta;
+                const rect = this._container.getBoundingClientRect();
+                const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+                const currentZoom = this._zoom + Math.log2(this._transform.scale);
+                const delta = -e.deltaY * 0.01;
+                let newZoom = currentZoom + delta;
+                newZoom = Math.max(this._options.minZoom, Math.min(this._options.maxZoom, newZoom));
 
-                const point = { x: e.clientX, y: e.clientY };
-                this._zoomAtPoint(newZoom, point, false); // Use fractional zoom for smoothness
+                const newScale = Math.pow(2, newZoom - this._zoom);
+                const oldScale = this._transform.scale;
 
-                // Debounce the zoomend event for a smoother experience
-                clearTimeout(this._zoomEndTimeout);
-                this._zoomEndTimeout = setTimeout(() => {
-                    // Snap to integer zoom and fire event
-                    this.setZoom(Math.round(this._zoom));
-                }, 200);
-            }
+                const dx = point.x * (1 - newScale / oldScale);
+                const dy = point.y * (1 - newScale / oldScale);
 
-            /** Handles double-click zooming. */
-            _onDblClick(e) {
-                e.preventDefault();
-                const point = { x: e.clientX, y: e.clientY };
-                this.setZoom(this._zoom + 1, { centerOn: point });
+                this._transform.x = this._transform.x * (newScale / oldScale) + dx;
+                this._transform.y = this._transform.y * (newScale / oldScale) + dy;
+                this._transform.scale = newScale;
+                this._updateTransform();
+
+                this._wheelDebounceTimeout = setTimeout(() => this._commitTransform(), this._options.wheelDebounce);
             }
 
             /** Handles the start of a touch interaction (pan or pinch). */
             _onTouchStart(e) {
+                this._commitInteraction(); // Commit any pending interactions
+
                 if (e.touches.length === 1) {
                     this._onDragStart(e);
-                } else if (e.touches.length === 2) {
+                } else if (e.touches.length >= 2) {
+                    this._isDragging = false;
+                    const rect = this._container.getBoundingClientRect();
                     this._isPinching = true;
                     this._pinchStartDist = this._getPinchDist(e);
-                    this._pinchStartZoom = this._zoom;
+                    this._pinchStartCenter = this._getPinchCenter(e, rect);
+                    this._pinchStartTransform = { ...this._transform };
                 }
             }
 
             /** Handles touch movement for panning or pinch-zooming. */
             _onTouchMove(e) {
-                if (this._isPinching && e.touches.length === 2) {
+                if (this._isPinching && e.touches.length >= 2) {
                     e.preventDefault();
-                    const dist = this._getPinchDist(e);
-                    const scale = dist / this._pinchStartDist;
-                    const newZoom = this._pinchStartZoom + Math.log2(scale);
-
-                    const t1 = e.touches[0];
-                    const t2 = e.touches[1];
-                    const pinchCenter = {
-                        x: (t1.clientX + t2.clientX) / 2,
-                        y: (t1.clientY + t2.clientY) / 2,
+                    const rect = this._container.getBoundingClientRect();
+                    const currentDist = this._getPinchDist(e);
+                    const currentCenter = this._getPinchCenter(e, rect);
+                    const scaleRatio = currentDist / this._pinchStartDist;
+                    const panDelta = {
+                        x: currentCenter.x - this._pinchStartCenter.x,
+                        y: currentCenter.y - this._pinchStartCenter.y,
                     };
-
-                    this._zoomAtPoint(newZoom, pinchCenter, false); // Don't snap zoom for pinch
-                } else if (e.touches.length === 1) {
+                    this._transform.scale = this._pinchStartTransform.scale * scaleRatio;
+                    this._transform.x = this._pinchStartTransform.x + panDelta.x + (this._pinchStartCenter.x * (1 - scaleRatio));
+                    this._transform.y = this._pinchStartTransform.y + panDelta.y + (this._pinchStartCenter.y * (1 - scaleRatio));
+                    this._updateTransform();
+                    this._fire('move');
+                } else if (e.touches.length === 1 && this._isDragging) {
                     this._onDragMove(e);
                 }
             }
 
             /** Handles the end of a touch interaction. */
             _onTouchEnd(e) {
-                if (this._isPinching) {
-                    // Snap the zoom level after pinch and let setZoom handle the event
-                    this.setZoom(Math.round(this._zoom));
-                }
-                if (e.touches.length < 2) {
+                if (this._isPinching && e.touches.length < 2) {
                     this._isPinching = false;
+                    this._commitTransform();
                 }
                 if (e.touches.length < 1) {
                     this._onDragEnd(e);
                 }
             }
 
-            /** Calculates the distance between two touch points for pinch-zoom. */
             _getPinchDist(e) {
                 const t1 = e.touches[0];
                 const t2 = e.touches[1];
                 return Math.sqrt(Math.pow(t1.clientX - t2.clientX, 2) + Math.pow(t1.clientY - t2.clientY, 2));
             }
 
+            _getPinchCenter(e, rect) {
+                const t1 = e.touches[0];
+                const t2 = e.touches[1];
+                return {
+                    x: (t1.clientX + t2.clientX) / 2 - rect.left,
+                    y: (t1.clientY + t2.clientY) / 2 - rect.top,
+                };
+            }
+
             /** Handles the start of a mouse or touch drag. */
             _onDragStart(e) {
                 if (e.type === 'touchstart' && e.touches.length > 1) return;
+                this._commitInteraction(); // Commit any pending interactions
 
                 e.preventDefault();
                 this._isDragging = true;
                 this._dragStart = this._getEventPoint(e);
                 this._container.style.cursor = 'grabbing';
                 this._dragMoved = false;
+                this._velocityHistory = [];
+                this._lastMoveTime = performance.now();
             }
 
             /** Handles mouse or touch movement during a drag. */
             _onDragMove(e) {
                 if (!this._isDragging) return;
                 if (e.type === 'touchmove' && e.touches.length > 1) return;
-
                 e.preventDefault();
                 const currentPoint = this._getEventPoint(e);
                 const dx = currentPoint.x - this._dragStart.x;
                 const dy = currentPoint.y - this._dragStart.y;
 
-                if (dx === 0 && dy === 0) return;
+                if (!this._dragMoved && Math.sqrt(dx*dx + dy*dy) < this._options.panThreshold) return;
 
                 this._dragMoved = true;
                 this._dragStart = currentPoint;
+                this._transform.x += dx;
+                this._transform.y += dy;
+                this._updateTransform();
 
-                // Directly update pixel origin for smooth panning
-                this._pixelOrigin.x -= dx;
-                this._pixelOrigin.y -= dy;
-
-                this._render();
-                this._fire('move'); // Firing continuous move event
+                const now = performance.now();
+                const dt = now - this._lastMoveTime;
+                if (dt > 0) {
+                    this._velocityHistory.push({ x: dx / dt, y: dy / dt });
+                    if (this._velocityHistory.length > 5) this._velocityHistory.shift();
+                }
+                this._lastMoveTime = now;
+                this._fire('move');
             }
 
             /** Handles the end of a mouse or touch drag. */
@@ -347,24 +392,153 @@
                 this._isDragging = false;
                 this._container.style.cursor = 'grab';
 
-                // Silently update the map's center based on the new pixel origin
+                if (this._options.inertia && this._dragMoved && this._velocityHistory.length > 0) {
+                    const avgVelocity = this._velocityHistory.reduce((acc, v) => ({ x: acc.x + v.x, y: acc.y + v.y }), { x: 0, y: 0 });
+                    avgVelocity.x /= this._velocityHistory.length;
+                    avgVelocity.y /= this._velocityHistory.length;
+                    const speed = Math.sqrt(avgVelocity.x * avgVelocity.x + avgVelocity.y * avgVelocity.y);
+                    if (speed > 0.1) {
+                        this._startInertiaAnimation(avgVelocity);
+                        return;
+                    }
+                }
+
+                if (this._dragMoved) {
+                    this._commitTransform();
+                } else {
+                    const now = performance.now();
+                    const point = this._getEventPoint(e);
+                    const rect = this._container.getBoundingClientRect();
+                    const containerPoint = { x: point.x - rect.left, y: point.y - rect.top };
+
+                    if (now - this._lastTapTime < 300) {
+                        clearTimeout(this._tapTimeout);
+                        this._lastTapTime = 0;
+                        if (this._options.doubleClickZoom) {
+                            this._commitTransform({ silent: true });
+                            const newZoom = this._zoom + 1;
+                            this._animateZoom(newZoom, containerPoint);
+                        }
+                    } else {
+                        this._lastTapTime = now;
+                        this._tapTimeout = setTimeout(() => {
+                            const latlng = this._unproject({
+                                x: containerPoint.x + this._pixelOrigin.x,
+                                y: containerPoint.y + this._pixelOrigin.y,
+                            });
+                            this._fire('click', { latlng, point: containerPoint });
+                        }, 300);
+                    }
+                }
+            }
+
+            /** Starts the inertia animation after a drag. */
+            _startInertiaAnimation(velocity) {
+                this._animationFrameId = requestAnimationFrame(() => this._inertiaStep(velocity));
+            }
+
+            /** A single step in the inertia animation loop. */
+            _inertiaStep(velocity) {
+                // Apply deceleration
+                velocity.x *= this._options.inertiaDeceleration;
+                velocity.y *= this._options.inertiaDeceleration;
+
+                // Update transform
+                this._transform.x += velocity.x;
+                this._transform.y += velocity.y;
+                this._updateTransform();
+
+                const speed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+                if (speed < 0.05) { // Stop when movement is negligible
+                    this._animationFrameId = null;
+                    this._finalizePan();
+                } else {
+                    this._animationFrameId = requestAnimationFrame(() => this._inertiaStep(velocity));
+                }
+            }
+
+            /**
+             * Commits the current transform to the map's base state (_pixelOrigin, _center, _zoom),
+             * then resets the transform and re-renders the map with fresh tiles.
+             * This is the single source of truth for finalizing an interaction.
+             */
+            _commitTransform(options = {}) {
+                const finalZoom = this._zoom + Math.log2(this._transform.scale);
+                // If a target zoom is provided (e.g., from an animation), use it. Otherwise, snap to the nearest integer.
+                const snappedZoom = options.targetZoom !== undefined ? options.targetZoom : Math.round(finalZoom);
+
+                // Update the pixel origin based on the final transform.
+                this._pixelOrigin.x -= this._transform.x;
+                this._pixelOrigin.y -= this._transform.y;
+
+                // Calculate the new geographical center based on the final state.
                 this._center = this._unproject({
                     x: this._pixelOrigin.x + this._width / 2,
                     y: this._pixelOrigin.y + this._height / 2
-                });
+                }, finalZoom);
 
-                if (this._dragMoved) {
-                    this._fire('moveend'); // Fire moveend only when drag completes
-                } else {
-                    // If no drag occurred, it's a click
-                    const point = this._getEventPoint(e);
-                    const rect = this._container.getBoundingClientRect();
-                    const latlng = this._unproject({
-                        x: point.x - rect.left + this._pixelOrigin.x,
-                        y: point.y - rect.top + this._pixelOrigin.y,
-                    });
-                    this._fire('click', { latlng, point: {x: point.x - rect.left, y: point.y - rect.top} });
+                // Reset the transform layer for the next interaction.
+                this._transform = { x: 0, y: 0, scale: 1 };
+                this._updateTransform();
+
+                // Set the new base zoom and trigger a full re-render.
+                this._zoom = snappedZoom;
+                this._updateView();
+
+                if (!options.silent) {
+                    this._fire('moveend');
+                    this._fire('zoomend', { zoom: this._zoom });
                 }
+            }
+
+            /** Animates a zoom to a new level, centered on a specific point. */
+            _animateZoom(targetZoom, point) {
+                // Get the zoom level at the start of the animation, including any temporary transform scale.
+                const startZoom = this._zoom + Math.log2(this._transform.scale);
+                targetZoom = Math.max(this._options.minZoom, Math.min(this._options.maxZoom, targetZoom));
+
+                if (Math.abs(targetZoom - startZoom) < 0.01) return;
+
+                const startTime = performance.now();
+                const duration = this._options.zoomAnimationDuration;
+                const startTransform = { ...this._transform };
+
+                const zoomStep = (timestamp) => {
+                    const progress = Math.min((timestamp - startTime) / duration, 1);
+                    // Use an easing function for a smooth, non-linear animation.
+                    const t = 1 - Math.pow(1 - progress, 3); // Ease-out cubic
+
+                    // Calculate the zoom and scale at the current animation frame.
+                    const currentZoom = startZoom + (targetZoom - startZoom) * t;
+                    const scale = Math.pow(2, currentZoom - this._zoom);
+
+                    // Calculate the translation needed to keep the focal point stationary.
+                    const dx = (point.x * (1 - scale / startTransform.scale));
+                    const dy = (point.y * (1 - scale / startTransform.scale));
+
+                    // Apply the interpolated scale and calculated translation.
+                    this._transform.scale = scale;
+                    this._transform.x = startTransform.x * (scale / startTransform.scale) + dx;
+                    this._transform.y = startTransform.y * (scale / startTransform.scale) + dy;
+                    this._updateTransform();
+
+                    if (progress < 1) {
+                        this._animationFrameId = requestAnimationFrame(zoomStep);
+                    } else {
+                        // When the animation completes, finalize the map's state.
+                        const newCenter = this._unproject({
+                            x: this._pixelOrigin.x - this._transform.x + this._width / 2,
+                            y: this._pixelOrigin.y - this._transform.y + this._height / 2,
+                        }, targetZoom);
+
+                        this._transform = {x: 0, y: 0, scale: 1};
+                        this._updateTransform();
+                        this.setView(newCenter, targetZoom);
+                        this._fire('zoomend', { zoom: this._zoom });
+                    }
+                };
+
+                this._animationFrameId = requestAnimationFrame(zoomStep);
             }
 
             /** Gets the screen coordinates from a mouse or touch event. */
@@ -439,6 +613,12 @@
                 };
 
                 this._render();
+            }
+
+            /** Applies the current transform to the transform pane. */
+            _updateTransform() {
+                const { x, y, scale } = this._transform;
+                this._transformPane.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
             }
 
             /** Generates a tile URL for the given XYZ coordinates. */
