@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Atlas.js</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        #map-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background-color: #ddd;
+            overflow: hidden;
+        }
+
+        .atlas-controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 3;
+            pointer-events: auto;
+        }
+
+        .atlas-zoom-button {
+            width: 30px;
+            height: 30px;
+            background-color: white;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+            margin-bottom: 5px;
+        }
+
+        .atlas-zoom-button:hover {
+            background-color: #f4f4f4;
+        }
+
+        .atlas-attribution {
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            z-index: 3;
+            background-color: rgba(255, 255, 255, 0.7);
+            padding: 2px 5px;
+            font-size: 12px;
+            font-family: sans-serif;
+            pointer-events: auto;
+        }
+
+        .atlas-attribution a {
+            color: #0078A8;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="map-container"></div>
+    <script>
+        /**
+         * Atlas.js - A lightweight, dependency-free, and self-contained JavaScript library for interactive maps.
+         * It uses native Canvas for tile rendering and SVG for UI controls and markers.
+         * Designed to be mobile-first and easy to understand.
+         */
+        class Atlas {
+            /**
+             * Initializes a new map instance.
+             * @param {string} containerId The ID of the HTML element that will contain the map.
+             * @param {object} [options={}] Configuration options for the map.
+             * @param {number[]} [options.center=[0, 0]] Initial geographical center of the map [latitude, longitude].
+             * @param {number} [options.zoom=1] Initial zoom level.
+             * @param {number} [options.minZoom=0] Minimum allowed zoom level.
+             * @param {number} [options.maxZoom=18] Maximum allowed zoom level.
+             * @param {string} [options.tileUrl='...'] URL template for map tiles.
+             * @param {string} [options.attribution='...'] Attribution text to display.
+             */
+            constructor(containerId, options = {}) {
+                this._container = document.getElementById(containerId);
+                if (!this._container) {
+                    throw new Error(`Container element with id "${containerId}" not found.`);
+                }
+
+                // --- Setup Core Properties ---
+
+                // Merge user options with defaults
+                this._options = {
+                    center: [0, 0],
+                    zoom: 1,
+                    minZoom: 0,
+                    maxZoom: 18,
+                    tileUrl: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                    ...options
+                };
+
+                // In-memory cache for tile images to avoid re-fetching
+                this._tileCache = new Map();
+                this._subdomains = ['a', 'b', 'c']; // For tile providers with subdomains
+
+                // Event handling system
+                this._events = {};
+
+                // Marker management
+                this._markers = [];
+
+                // --- Initialization ---
+                this._initLayout();
+                this.setView(this._options.center, this._options.zoom);
+            }
+
+            /**
+             * Sets up the map's DOM structure, including canvas for tiles and SVG for overlays.
+             * @private
+             */
+            _initLayout() {
+                // Ensure the container has a relative position for absolute child elements
+                this._container.style.position = this._container.style.position || 'relative';
+                this._container.style.cursor = 'grab';
+
+                // Create canvas for rendering map tiles
+                this._canvas = document.createElement('canvas');
+                this._canvas.style.position = 'absolute';
+                this._canvas.style.top = '0';
+                this._canvas.style.left = '0';
+                this._canvas.style.zIndex = '1';
+                this._container.appendChild(this._canvas);
+                this._ctx = this._canvas.getContext('2d');
+
+                // Create SVG layer for markers and other vector overlays
+                this._svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                this._svg.style.position = 'absolute';
+                this._svg.style.top = '0';
+                this._svg.style.left = '0';
+                this._svg.style.width = '100%';
+                this._svg.style.height = '100%';
+                this._svg.style.zIndex = '2';
+                // Let pointer events (like clicks and drags) pass through to the container/canvas
+                this._svg.style.pointerEvents = 'none';
+                this._container.appendChild(this._svg);
+
+                // A dedicated SVG group for markers to keep them organized
+                this._markerPane = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                this._svg.appendChild(this._markerPane);
+
+                // Add UI elements like zoom buttons and attribution
+                this._initControls();
+
+                // Observe container resizing to keep the map dimensions updated
+                this._resizeObserver = new ResizeObserver(() => this._onResize());
+                this._resizeObserver.observe(this._container);
+
+                // Attach all necessary event listeners for interactions
+                this._addEventListeners();
+
+                // Perform initial size calculation
+                this._onResize();
+            }
+
+            /**
+             * Creates and adds UI controls (zoom buttons, attribution) to the map.
+             * @private
+             */
+            _initControls() {
+                const controlsContainer = document.createElement('div');
+                controlsContainer.className = 'atlas-controls';
+                this._container.appendChild(controlsContainer);
+
+                // Zoom In Button
+                const zoomInButton = document.createElement('div');
+                zoomInButton.className = 'atlas-zoom-button';
+                zoomInButton.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 3v7m-3.5-3.5h7" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>';
+                zoomInButton.onclick = (e) => {
+                    e.stopPropagation(); // Prevent map click event
+                    this.setZoom(this._zoom + 1);
+                };
+                controlsContainer.appendChild(zoomInButton);
+
+                // Zoom Out Button
+                const zoomOutButton = document.createElement('div');
+                zoomOutButton.className = 'atlas-zoom-button';
+                zoomOutButton.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20"><path d="M6.5 10h7" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>';
+                zoomOutButton.onclick = (e) => {
+                    e.stopPropagation(); // Prevent map click event
+                    this.setZoom(this._zoom - 1);
+                };
+                controlsContainer.appendChild(zoomOutButton);
+
+                // Attribution Text
+                if (this._options.attribution) {
+                    const attributionControl = document.createElement('div');
+                    attributionControl.className = 'atlas-attribution';
+                    attributionControl.innerHTML = this._options.attribution;
+                    this._container.appendChild(attributionControl);
+                }
+            }
+
+            /**
+             * Attaches all event listeners for map interactions.
+             * @private
+             */
+            _addEventListeners() {
+                // Mouse drag events
+                this._container.addEventListener('mousedown', (e) => this._onDragStart(e));
+                window.addEventListener('mousemove', (e) => this._onDragMove(e));
+                window.addEventListener('mouseup', (e) => this._onDragEnd(e));
+
+                // Touch drag and pinch-zoom events
+                this._container.addEventListener('touchstart', (e) => this._onTouchStart(e), { passive: false });
+                window.addEventListener('touchmove', (e) => this._onTouchMove(e), { passive: false });
+                window.addEventListener('touchend', (e) => this._onTouchEnd(e));
+
+                // Mouse wheel zoom
+                this._container.addEventListener('wheel', (e) => this._onWheel(e));
+
+                // Double-click zoom
+                this._container.addEventListener('dblclick', (e) => this._onDblClick(e));
+            }
+
+            // --- Interaction Handlers ---
+
+            /** Handles mouse wheel zooming. */
+            _onWheel(e) {
+                e.preventDefault();
+
+                const delta = e.deltaY > 0 ? -1 : 1;
+                const newZoom = this._zoom + delta;
+
+                const point = { x: e.clientX, y: e.clientY };
+                this._zoomAtPoint(newZoom, point, false); // Use fractional zoom for smoothness
+
+                // Debounce the zoomend event for a smoother experience
+                clearTimeout(this._zoomEndTimeout);
+                this._zoomEndTimeout = setTimeout(() => {
+                    // Snap to integer zoom and fire event
+                    this.setZoom(Math.round(this._zoom));
+                }, 200);
+            }
+
+            /** Handles double-click zooming. */
+            _onDblClick(e) {
+                e.preventDefault();
+                const point = { x: e.clientX, y: e.clientY };
+                this.setZoom(this._zoom + 1, { centerOn: point });
+            }
+
+            /** Handles the start of a touch interaction (pan or pinch). */
+            _onTouchStart(e) {
+                if (e.touches.length === 1) {
+                    this._onDragStart(e);
+                } else if (e.touches.length === 2) {
+                    this._isPinching = true;
+                    this._pinchStartDist = this._getPinchDist(e);
+                    this._pinchStartZoom = this._zoom;
+                }
+            }
+
+            /** Handles touch movement for panning or pinch-zooming. */
+            _onTouchMove(e) {
+                if (this._isPinching && e.touches.length === 2) {
+                    e.preventDefault();
+                    const dist = this._getPinchDist(e);
+                    const scale = dist / this._pinchStartDist;
+                    const newZoom = this._pinchStartZoom + Math.log2(scale);
+
+                    const t1 = e.touches[0];
+                    const t2 = e.touches[1];
+                    const pinchCenter = {
+                        x: (t1.clientX + t2.clientX) / 2,
+                        y: (t1.clientY + t2.clientY) / 2,
+                    };
+
+                    this._zoomAtPoint(newZoom, pinchCenter, false); // Don't snap zoom for pinch
+                } else if (e.touches.length === 1) {
+                    this._onDragMove(e);
+                }
+            }
+
+            /** Handles the end of a touch interaction. */
+            _onTouchEnd(e) {
+                if (this._isPinching) {
+                    // Snap the zoom level after pinch and let setZoom handle the event
+                    this.setZoom(Math.round(this._zoom));
+                }
+                if (e.touches.length < 2) {
+                    this._isPinching = false;
+                }
+                if (e.touches.length < 1) {
+                    this._onDragEnd(e);
+                }
+            }
+
+            /** Calculates the distance between two touch points for pinch-zoom. */
+            _getPinchDist(e) {
+                const t1 = e.touches[0];
+                const t2 = e.touches[1];
+                return Math.sqrt(Math.pow(t1.clientX - t2.clientX, 2) + Math.pow(t1.clientY - t2.clientY, 2));
+            }
+
+            /** Handles the start of a mouse or touch drag. */
+            _onDragStart(e) {
+                if (e.type === 'touchstart' && e.touches.length > 1) return;
+
+                e.preventDefault();
+                this._isDragging = true;
+                this._dragStart = this._getEventPoint(e);
+                this._container.style.cursor = 'grabbing';
+                this._dragMoved = false;
+            }
+
+            /** Handles mouse or touch movement during a drag. */
+            _onDragMove(e) {
+                if (!this._isDragging) return;
+                if (e.type === 'touchmove' && e.touches.length > 1) return;
+
+                e.preventDefault();
+                const currentPoint = this._getEventPoint(e);
+                const dx = currentPoint.x - this._dragStart.x;
+                const dy = currentPoint.y - this._dragStart.y;
+
+                if (dx === 0 && dy === 0) return;
+
+                this._dragMoved = true;
+                this._dragStart = currentPoint;
+
+                // Directly update pixel origin for smooth panning
+                this._pixelOrigin.x -= dx;
+                this._pixelOrigin.y -= dy;
+
+                this._render();
+                this._fire('move'); // Firing continuous move event
+            }
+
+            /** Handles the end of a mouse or touch drag. */
+            _onDragEnd(e) {
+                if (!this._isDragging) return;
+                this._isDragging = false;
+                this._container.style.cursor = 'grab';
+
+                // Silently update the map's center based on the new pixel origin
+                this._center = this._unproject({
+                    x: this._pixelOrigin.x + this._width / 2,
+                    y: this._pixelOrigin.y + this._height / 2
+                });
+
+                if (this._dragMoved) {
+                    this._fire('moveend'); // Fire moveend only when drag completes
+                } else {
+                    // If no drag occurred, it's a click
+                    const point = this._getEventPoint(e);
+                    const rect = this._container.getBoundingClientRect();
+                    const latlng = this._unproject({
+                        x: point.x - rect.left + this._pixelOrigin.x,
+                        y: point.y - rect.top + this._pixelOrigin.y,
+                    });
+                    this._fire('click', { latlng, point: {x: point.x - rect.left, y: point.y - rect.top} });
+                }
+            }
+
+            /** Gets the screen coordinates from a mouse or touch event. */
+            _getEventPoint(e) {
+                const point = e.touches ? e.touches[0] : e;
+                return { x: point.clientX, y: point.clientY };
+            }
+
+            /** Handles map container resizing. */
+            _onResize() {
+                this._width = this._container.clientWidth;
+                this._height = this._container.clientHeight;
+
+                this._canvas.width = this._width;
+                this._canvas.height = this._height;
+
+                if (this._center && this._zoom !== undefined) {
+                    this._updateView();
+                }
+            }
+
+            // --- Coordinate and Tile Utilities ---
+
+            /**
+             * Projects geographical coordinates (lat, lng) to world pixel coordinates at a given zoom level.
+             * Uses the Web Mercator projection (EPSG:3857).
+             * @param {number[]} latlng - The geographical coordinates [latitude, longitude].
+             * @param {number} [zoom] - The zoom level to project at. Defaults to the current map zoom.
+             * @returns {{x: number, y: number}} The world pixel coordinates.
+             * @private
+             */
+            _project(latlng, zoom) {
+                const z = zoom === undefined ? this._zoom : zoom;
+                const d = Math.PI / 180;
+                const max = 1 - 1e-15;
+                const sin = Math.max(Math.min(Math.sin(latlng[0] * d), max), -max);
+
+                const scale = 256 * Math.pow(2, z);
+
+                const x = scale * (latlng[1] / 360 + 0.5);
+                const y = scale * (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI));
+
+                return { x, y };
+            }
+
+            /**
+             * Unprojects world pixel coordinates to geographical coordinates (lat, lng) at a given zoom level.
+             * @param {{x: number, y: number}} point - The world pixel coordinates.
+             * @param {number} [zoom] - The zoom level to unproject at. Defaults to the current map zoom.
+             * @returns {number[]} The geographical coordinates [latitude, longitude].
+             * @private
+             */
+            _unproject(point, zoom) {
+                const z = zoom === undefined ? this._zoom : zoom;
+                const d = 180 / Math.PI;
+                const scale = 256 * Math.pow(2, z);
+
+                const lng = (point.x / scale - 0.5) * 360;
+                const lat = (2 * Math.atan(Math.exp((0.5 - point.y / scale) * 4 * Math.PI)) - Math.PI / 2) * d;
+
+                return [lat, lng];
+            }
+
+            /** Recalculates the map's pixel origin and triggers a re-render. */
+            _updateView() {
+                const centerPx = this._project(this._center);
+
+                // The top-left corner of the viewport in world pixel coordinates
+                this._pixelOrigin = {
+                    x: centerPx.x - this._width / 2,
+                    y: centerPx.y - this._height / 2
+                };
+
+                this._render();
+            }
+
+            /** Generates a tile URL for the given XYZ coordinates. */
+            _getTileUrl(x, y, z) {
+                const s = this._subdomains[(x + y) % this._subdomains.length];
+                return this._options.tileUrl
+                    .replace('{s}', s)
+                    .replace('{z}', z)
+                    .replace('{x}', x)
+                    .replace('{y}', y);
+            }
+
+            // --- Rendering ---
+
+            /** Schedules a repaint of the map. Uses requestAnimationFrame for performance. */
+            _render() {
+                if (this._renderId) {
+                    cancelAnimationFrame(this._renderId);
+                }
+                this._renderId = requestAnimationFrame(() => this._renderFrame());
+            }
+
+            /** The main rendering loop that draws tiles and markers. */
+            _renderFrame() {
+                this._ctx.clearRect(0, 0, this._width, this._height);
+                if (!this._pixelOrigin) return;
+
+                this._renderMarkers();
+
+                const TILE_SIZE = 256;
+                const zoom = this._zoom;
+
+                // Calculate the range of tiles visible in the viewport
+                const minTileX = Math.floor(this._pixelOrigin.x / TILE_SIZE);
+                const minTileY = Math.floor(this._pixelOrigin.y / TILE_SIZE);
+                const maxTileX = Math.ceil((this._pixelOrigin.x + this._width) / TILE_SIZE) - 1;
+                const maxTileY = Math.ceil((this._pixelOrigin.y + this._height) / TILE_SIZE) - 1;
+
+                // Loop through visible tiles and draw them
+                for (let y = minTileY; y <= maxTileY; y++) {
+                    for (let x = minTileX; x <= maxTileX; x++) {
+                        const tileId = `${zoom}/${x}/${y}`;
+                        const cachedTile = this._tileCache.get(tileId);
+
+                        if (cachedTile && cachedTile.loaded) {
+                            const tileX = x * TILE_SIZE - this._pixelOrigin.x;
+                            const tileY = y * TILE_SIZE - this._pixelOrigin.y;
+                            this._ctx.drawImage(cachedTile.image, tileX, tileY, TILE_SIZE, TILE_SIZE);
+                        } else if (!cachedTile || !cachedTile.loading) {
+                            // Load tile if not in cache or not already loading
+                            const img = new Image();
+                            img.src = this._getTileUrl(x, y, zoom);
+                            img.onload = () => {
+                                this._tileCache.set(tileId, { image: img, loaded: true, loading: false });
+                                this._render(); // Redraw when tile loads
+                            };
+                            img.onerror = () => {
+                                this._tileCache.set(tileId, { image: null, loaded: false, loading: false });
+                            };
+                            this._tileCache.set(tileId, { image: img, loaded: false, loading: true });
+                        }
+                    }
+                }
+            }
+
+            // --- Event System ---
+
+            /**
+             * Subscribes a listener function to a map event.
+             * @param {string} type - The event type (e.g., 'click', 'zoomend').
+             * @param {Function} fn - The listener function.
+             * @returns {Atlas} The map instance for chaining.
+             */
+            on(type, fn) {
+                if (!this._events[type]) {
+                    this._events[type] = [];
+                }
+                this._events[type].push(fn);
+                return this;
+            }
+
+            /** Fires an event, calling all subscribed listeners. @private */
+            _fire(type, data) {
+                if (!this._events[type]) return;
+
+                const event = { type, target: this, ...data };
+                this._events[type].forEach(fn => fn(event));
+            }
+
+            // --- Public API ---
+
+            /**
+             * Sets the map view to a new center and zoom.
+             * @param {number[]} latlng - The new center [latitude, longitude].
+             * @param {number} zoom - The new zoom level.
+             */
+            setView(latlng, zoom) {
+                const oldZoom = this._zoom;
+                const oldCenter = this._center;
+                const newZoom = Math.max(this._options.minZoom, Math.min(this._options.maxZoom, zoom));
+
+                const zoomChanged = oldZoom !== undefined && newZoom !== oldZoom;
+                const centerChanged = !oldCenter || (latlng[0] !== oldCenter[0] || latlng[1] !== oldCenter[1]);
+
+                this._zoom = newZoom;
+                this._center = latlng;
+
+                this._updateView();
+
+                if (centerChanged) this._fire('move');
+                if (zoomChanged) this._fire('zoom', { zoom: this._zoom });
+            }
+
+            /**
+             * Sets the map's zoom level.
+             * @param {number} zoom - The new zoom level.
+             * @param {object} [options] - Zoom options.
+             * @param {{x: number, y: number}} [options.centerOn] - The screen point to keep centered during zoom.
+             */
+            setZoom(zoom, options = {}) {
+                const oldZoom = this._zoom;
+                const newZoom = Math.max(this._options.minZoom, Math.min(this._options.maxZoom, zoom));
+
+                if (newZoom === oldZoom) return;
+
+                if (options.centerOn) {
+                    this._zoomAtPoint(newZoom, options.centerOn, true);
+                } else {
+                    this.setView(this._center, newZoom);
+                }
+
+                this._fire('zoomend', { zoom: this._zoom });
+            }
+
+            /** Zooms the map while keeping a specific screen point fixed. @private */
+            _zoomAtPoint(newZoom, point, snap = true) {
+                let zoom = snap ? Math.round(newZoom) : newZoom;
+                zoom = Math.max(this._options.minZoom, Math.min(this._options.maxZoom, zoom));
+
+                if (zoom === this._zoom) return;
+
+                const rect = this._container.getBoundingClientRect();
+                const screenPoint = { x: point.x - rect.left, y: point.y - rect.top };
+
+                // Get the geographical coordinate of the point before zoom
+                const worldPoint = { x: screenPoint.x + this._pixelOrigin.x, y: screenPoint.y + this._pixelOrigin.y };
+                const latlng = this._unproject(worldPoint, this._zoom);
+
+                // Calculate where the new center should be to keep the point fixed
+                const newCenterPx = this._project(latlng, zoom);
+                const newPixelOrigin = { x: newCenterPx.x - screenPoint.x, y: newCenterPx.y - screenPoint.y };
+
+                const newCenter = this._unproject({
+                    x: newPixelOrigin.x + this._width / 2,
+                    y: newPixelOrigin.y + this._height / 2
+                }, zoom);
+
+                this.setView(newCenter, zoom);
+            }
+
+            // --- Marker System ---
+
+            /**
+             * Adds a new SVG marker to the map.
+             * @param {number[]} latlng - The marker's geographical position [latitude, longitude].
+             * @param {object} [options={}] - Marker options.
+             * @param {string} [options.color='#3498db'] - The marker's fill color.
+             * @param {string} [options.label] - A single character label to display on the marker.
+             * @returns {object} The marker object.
+             */
+            addMarker(latlng, options = {}) {
+                const marker = {
+                    latlng,
+                    options,
+                    el: this._createMarkerElement(options)
+                };
+
+                this._markers.push(marker);
+                this._markerPane.appendChild(marker.el);
+                this._renderMarkers();
+
+                return marker;
+            }
+
+            /** Creates the SVG elements for a marker. @private */
+            _createMarkerElement(options) {
+                const el = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                el.style.pointerEvents = 'auto'; // Make marker clickable
+                el.style.cursor = 'pointer';
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('r', '10');
+                circle.setAttribute('fill', options.color || '#3498db');
+                circle.setAttribute('stroke', 'white');
+                circle.setAttribute('stroke-width', '2');
+                el.appendChild(circle);
+
+                if (options.label) {
+                    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    text.textContent = options.label;
+                    text.setAttribute('text-anchor', 'middle');
+                    text.setAttribute('dy', '.35em');
+                    text.setAttribute('fill', 'white');
+                    text.setAttribute('font-size', '10px');
+                    text.setAttribute('font-family', 'sans-serif');
+                    el.appendChild(text);
+                }
+
+                return el;
+            }
+
+            /** Positions all markers on the map according to the current view. @private */
+            _renderMarkers() {
+                for (const marker of this._markers) {
+                    const px = this._project(marker.latlng);
+                    const screenX = px.x - this._pixelOrigin.x;
+                    const screenY = px.y - this._pixelOrigin.y;
+
+                    marker.el.setAttribute('transform', `translate(${screenX}, ${screenY})`);
+                }
+            }
+        }
+
+        // --- Demo Initialization ---
+
+        // Create a new map instance
+        const map = new Atlas('map-container', {
+            center: [51.505, -0.09], // London
+            zoom: 13
+        });
+
+        // Log map events to the console for debugging
+        map.on('click', (e) => console.log('Click event:', e));
+        map.on('zoomend', (e) => console.log('ZoomEnd event:', e));
+        map.on('moveend', (e) => console.log('MoveEnd event:', e));
+
+        // Add some example markers
+        map.addMarker([51.505, -0.09], { color: '#e74c3c', label: 'C' });
+        map.addMarker([51.51, -0.1], { color: '#2ecc71', label: 'A' });
+        map.addMarker([51.5, -0.12], { label: 'B' });
+    </script>
+</body>
+</html>
