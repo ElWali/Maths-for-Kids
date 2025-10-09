@@ -1593,44 +1593,36 @@
   }
 
   // ============================================================================
-  // NEW: ATTRIBUTION CONTROL
+  // ATTRIBUTION CONTROL (Refactored)
   // ============================================================================
-  class AttributionControl extends EventEmitter {
+  class AttributionControl extends Control {
     constructor(options = {}) {
-      super();
-      this.options = {
-        position: 'bottomright',
-        prefix: 'Nexus Maps',
-        ...options
-      };
+      super({ position: 'bottomright', ...options });
+      this.options.prefix = options.prefix === undefined ? 'Nexus Maps' : options.prefix;
       this._attributions = new Map();
-      this._container = null;
     }
+
     onAdd(map) {
-      this._map = map;
-      this._container = $.create('div', 'nexus-control-attribution');
-      this._container.setAttribute('role', 'contentinfo');
-      this._container.setAttribute('aria-label', 'Map attribution');
-      this._container.style.cssText = `
-        position: absolute;
-        ${this.options.position.includes('bottom') ? 'bottom: 0;' : 'top: 0;'}
-        ${this.options.position.includes('right') ? 'right: 0;' : 'left: 0;'}
+      super.onAdd(map); // Sets this._map and this._container
+      this._update();
+      // The super.onAdd already appends the container, so no need to do it here.
+      return this._container;
+    }
+
+    draw() {
+      const container = $.create('div', 'nexus-control-attribution nexus-control');
+      container.setAttribute('role', 'contentinfo');
+      container.setAttribute('aria-label', 'Map attribution');
+      container.style.cssText = `
         background: rgba(255, 255, 255, 0.8);
         padding: 2px 8px;
         font-size: 11px;
         line-height: 1.4;
         max-width: 100%;
         box-sizing: border-box;
-        z-index: 1000;
+        pointer-events: auto; /* Allow clicks on links */
       `;
-      map._container.appendChild(this._container);
-      this._update();
-      return this._container;
-    }
-    onRemove() {
-      $.remove(this._container);
-      this._container = null;
-      this._map = null;
+      return container;
     }
     addAttribution(text) {
       if (!text) return this;
@@ -1671,6 +1663,294 @@
   }
 
   // ============================================================================
+  // NEW: BASE CONTROL CLASS
+  // ============================================================================
+  class Control extends EventEmitter {
+    constructor(options = {}) {
+      super();
+      this.options = { position: 'topright', ...options };
+      this._map = null;
+      this._container = null;
+    }
+    addTo(map) {
+      if (!(map instanceof NexusMap)) {
+        throw new Error('Control.addTo: map must be a NexusMap instance');
+      }
+      map.addControl(this);
+      return this;
+    }
+    remove() {
+      if (this._map) {
+        this._map.removeControl(this);
+      }
+      return this;
+    }
+    onAdd(map) {
+      // To be implemented by subclasses
+      this._map = map;
+      this._container = this.draw();
+      const corner = this._map._controlCorners[this.options.position];
+      if (corner) {
+        corner.appendChild(this._container);
+      }
+      return this._container;
+    }
+    onRemove() {
+      // To be implemented by subclasses
+      $.remove(this._container);
+      this._container = null;
+      this._map = null;
+    }
+    draw() {
+      // Subclasses must implement this method to return an HTMLElement
+      return $.create('div', 'nexus-control');
+    }
+    getContainer() {
+      return this._container;
+    }
+  }
+
+  // ============================================================================
+  // NEW: LAYERS CONTROL
+  // ============================================================================
+  class LayersControl extends Control {
+    constructor(baseLayers = {}, overlays = {}, options = {}) {
+      super({ position: 'topright', ...options });
+      this.options.collapsed = options.collapsed === undefined ? true : options.collapsed;
+      this._baseLayers = new Map();
+      this._overlays = new Map();
+      this._layerControlIdCounter = 0;
+
+      for (const name in baseLayers) {
+        this.addBaseLayer(baseLayers[name], name);
+      }
+      for (const name in overlays) {
+        this.addOverlay(overlays[name], name);
+      }
+    }
+
+    onAdd(map) {
+      super.onAdd(map); // Creates this._container
+      if (this.options.collapsed) {
+        this._container.addEventListener('mouseenter', this._expand.bind(this));
+        this._container.addEventListener('mouseleave', this._collapse.bind(this));
+      }
+      this._update();
+      return this._container;
+    }
+
+    onRemove() {
+      // Clean up event listeners if any were added to the map
+      super.onRemove();
+    }
+
+    draw() {
+      const container = $.create('div', 'nexus-control-layers nexus-control');
+      container.style.cssText = `
+        background: white;
+        border-radius: 4px;
+        box-shadow: 0 1px 5px rgba(0,0,0,0.2);
+        clear: both;
+      `;
+
+      this._layersLink = $.create('a', 'nexus-control-layers-toggle', container);
+      this._layersLink.href = '#';
+      this._layersLink.title = 'Layers';
+      this._layersLink.setAttribute('role', 'button');
+      this._layersLink.setAttribute('aria-haspopup', 'true');
+      this._layersLink.setAttribute('aria-expanded', 'false');
+      this._layersLink.style.cssText = `
+        display: block;
+        width: 36px;
+        height: 36px;
+        background-image: url('data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93s3.05-7.44 7-7.93v15.86zm2-15.86c1.03.13 2 .45 2.87.93L15.87 5H14v.07zm0 4.07V11h2.13c.05.33.07.66.07 1s-.02.67-.07 1H14v1.93c.87.48 1.84.8 2.87.93H14v2.07c3.95-.49 7-3.85 7-7.93s-3.05-7.44-7-7.93z"/></svg>')');
+        background-size: 24px 24px;
+        background-position: center;
+        background-repeat: no-repeat;
+      `;
+
+      this._form = $.create('form', 'nexus-control-layers-list', container);
+      this._form.style.display = this.options.collapsed ? 'none' : 'block';
+      this._form.style.padding = '6px 10px';
+      this._form.style.lineHeight = '1.5';
+
+      this._baseLayersList = $.create('div', 'nexus-control-layers-base', this._form);
+      this._separator = $.create('div', 'nexus-control-layers-separator', this._form);
+      this._separator.style.borderTop = '1px solid #ddd';
+      this._separator.style.margin = '5px 0';
+      this._overlaysList = $.create('div', 'nexus-control-layers-overlays', this._form);
+
+      return container;
+    }
+
+    addBaseLayer(layer, name) {
+      this._addLayer(layer, name, false);
+      return this;
+    }
+
+    addOverlay(layer, name) {
+      this._addLayer(layer, name, true);
+      return this;
+    }
+
+    _addLayer(layer, name, isOverlay) {
+      const id = `nexus-layer-control-${this._layerControlIdCounter++}`;
+      layer._nexusLayerId = id;
+
+      const list = isOverlay ? this._overlays : this._baseLayers;
+      list.set(id, { layer, name });
+
+      if (this._map) {
+        this._update();
+      }
+    }
+
+    _update() {
+      if (!this._form) return;
+
+      this._baseLayersList.innerHTML = '';
+      this._overlaysList.innerHTML = '';
+
+      let hasBaseLayers = false;
+      let hasOverlays = false;
+
+      this._baseLayers.forEach((obj, id) => {
+        this._createLayerItem(obj, id, false);
+        hasBaseLayers = true;
+      });
+
+      this._overlays.forEach((obj, id) => {
+        this._createLayerItem(obj, id, true);
+        hasOverlays = true;
+      });
+
+      this._separator.style.display = hasBaseLayers && hasOverlays ? '' : 'none';
+    }
+
+    _createLayerItem(obj, id, isOverlay) {
+      const label = document.createElement('label');
+      label.style.display = 'block';
+
+      const input = document.createElement('input');
+      input.type = isOverlay ? 'checkbox' : 'radio';
+      input.name = isOverlay ? `overlay-${id}` : 'nexus-base-layer';
+      input.checked = this._map.hasLayer(obj.layer);
+      input.layerId = id;
+      input.style.marginRight = '5px';
+
+      input.addEventListener('click', () => this._onInputChange(input, isOverlay));
+
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = obj.name;
+
+      label.appendChild(input);
+      label.appendChild(nameSpan);
+
+      const list = isOverlay ? this._overlaysList : this._baseLayersList;
+      list.appendChild(label);
+    }
+
+    _onInputChange(input, isOverlay) {
+      const id = input.layerId;
+      const obj = (isOverlay ? this._overlays : this._baseLayers).get(id);
+
+      if (input.checked && !this._map.hasLayer(obj.layer)) {
+        this._map.addLayer(obj.layer);
+      } else if (!input.checked && this._map.hasLayer(obj.layer)) {
+        this._map.removeLayer(obj.layer);
+      }
+
+      if (!isOverlay) {
+        this._baseLayers.forEach((otherObj, otherId) => {
+          if (otherId !== id && this._map.hasLayer(otherObj.layer)) {
+            this._map.removeLayer(otherObj.layer);
+          }
+        });
+      }
+    }
+
+    _expand() {
+      this._form.style.display = '';
+      this._container.style.width = 'auto';
+      this._layersLink.setAttribute('aria-expanded', 'true');
+    }
+
+    _collapse() {
+      this._form.style.display = 'none';
+      this._container.style.width = '';
+      this._layersLink.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  // ============================================================================
+  // ZOOM CONTROL (Refactored)
+  // ============================================================================
+  class ZoomControl extends Control {
+    constructor(options = {}) {
+      super({ position: 'topright', ...options });
+    }
+
+    draw() {
+      const container = $.create('div', 'nexus-zoom-control nexus-control');
+      container.setAttribute('role', 'group');
+      container.setAttribute('aria-label', 'Map zoom controls');
+      container.style.cssText = `
+        background: white;
+        border-radius: 4px;
+        box-shadow: 0 1px 5px rgba(0,0,0,0.2);
+        overflow: hidden;
+      `;
+
+      const zoomIn = $.create('button', 'nexus-zoom-in', container);
+      zoomIn.type = 'button';
+      zoomIn.innerHTML = '+';
+      zoomIn.setAttribute('aria-label', 'Zoom in');
+      zoomIn.style.cssText = `
+        display: block;
+        width: 32px;
+        height: 32px;
+        border: none;
+        background: white;
+        cursor: pointer;
+        font-size: 18px;
+        font-weight: bold;
+        transition: background-color 0.2s;
+      `;
+      zoomIn.onmouseenter = () => zoomIn.style.backgroundColor = '#f0f0f0';
+      zoomIn.onmouseleave = () => zoomIn.style.backgroundColor = 'white';
+      zoomIn.onclick = (e) => {
+        e.stopPropagation();
+        this._map.zoomIn();
+      };
+
+      const zoomOut = $.create('button', 'nexus-zoom-out', container);
+      zoomOut.type = 'button';
+      zoomOut.innerHTML = '−';
+      zoomOut.setAttribute('aria-label', 'Zoom out');
+      zoomOut.style.cssText = `
+        display: block;
+        width: 32px;
+        height: 32px;
+        border: none;
+        background: white;
+        cursor: pointer;
+        font-size: 18px;
+        font-weight: bold;
+        border-top: 1px solid #ddd;
+        transition: background-color 0.2s;
+      `;
+      zoomOut.onmouseenter = () => zoomOut.style.backgroundColor = '#f0f0f0';
+      zoomOut.onmouseleave = () => zoomOut.style.backgroundColor = 'white';
+      zoomOut.onclick = (e) => {
+        e.stopPropagation();
+        this._map.zoomOut();
+      };
+
+      return container;
+    }
+  }
+
+  // ============================================================================
   // MAP (Enhanced with new features)
   // ============================================================================
   class NexusMap extends EventEmitter {
@@ -1706,6 +1986,12 @@
       this._renderer = null;
       this._controls = [];
       this._init();
+
+      if (this.options.layers) {
+        this.options.layers.forEach(layer => {
+          this.addLayer(layer);
+        });
+      }
     }
     _init() {
       this._container.style.cssText = `
@@ -1754,7 +2040,40 @@
       if (this.options.trackResize) {
         this._setupResizeObserver();
       }
+      this._initControls();
       this._update();
+    }
+    _initControls() {
+      this._controlCorners = {
+        topleft: $.create('div', 'nexus-control-corner nexus-control-top nexus-control-left', this._container),
+        topright: $.create('div', 'nexus-control-corner nexus-control-top nexus-control-right', this._container),
+        bottomleft: $.create('div', 'nexus-control-corner nexus-control-bottom nexus-control-left', this._container),
+        bottomright: $.create('div', 'nexus-control-corner nexus-control-bottom nexus-control-right', this._container),
+      };
+      for (const corner in this._controlCorners) {
+        this._controlCorners[corner].style.cssText = `
+          position: absolute;
+          z-index: 1000;
+          pointer-events: none;
+        `;
+      }
+      this._controlCorners.topleft.style.top = '0';
+      this._controlCorners.topleft.style.left = '0';
+      this._controlCorners.topright.style.top = '0';
+      this._controlCorners.topright.style.right = '0';
+      this._controlCorners.bottomleft.style.bottom = '0';
+      this._controlCorners.bottomleft.style.left = '0';
+      this._controlCorners.bottomright.style.bottom = '0';
+      this._controlCorners.bottomright.style.right = '0';
+
+      if (this.options.zoomControl) {
+        this.zoomControl = new ZoomControl();
+        this.addControl(this.zoomControl);
+      }
+      if (this.options.attributionControl) {
+        this.attributionControl = new AttributionControl();
+        this.addControl(this.attributionControl);
+      }
     }
     _setupInteractions() {
       this._interactionHandlers = [];
@@ -1975,58 +2294,6 @@
         this._resizeObserver = null;
       }
     }
-    _addZoomControl() {
-      const control = $.create('div', 'nexus-zoom-control', this._container);
-      control.setAttribute('role', 'group');
-      control.setAttribute('aria-label', 'Map zoom controls');
-      control.style.cssText = `
-        position: absolute;
-        top: 10px;
-        right: 10px;
-        background: white;
-        border-radius: 4px;
-        box-shadow: 0 1px 5px rgba(0,0,0,0.2);
-        overflow: hidden;
-        z-index: 1000;
-      `;
-      const zoomIn = $.create('button', 'nexus-zoom-in', control);
-      zoomIn.type = 'button';
-      zoomIn.innerHTML = '+';
-      zoomIn.setAttribute('aria-label', 'Zoom in');
-      zoomIn.style.cssText = `
-        display: block;
-        width: 32px;
-        height: 32px;
-        border: none;
-        background: white;
-        cursor: pointer;
-        font-size: 18px;
-        font-weight: bold;
-        transition: background-color 0.2s;
-      `;
-      zoomIn.onmouseenter = () => zoomIn.style.backgroundColor = '#f0f0f0';
-      zoomIn.onmouseleave = () => zoomIn.style.backgroundColor = 'white';
-      zoomIn.onclick = () => this.zoomIn();
-      const zoomOut = $.create('button', 'nexus-zoom-out', control);
-      zoomOut.type = 'button';
-      zoomOut.innerHTML = '−';
-      zoomOut.setAttribute('aria-label', 'Zoom out');
-      zoomOut.style.cssText = `
-        display: block;
-        width: 32px;
-        height: 32px;
-        border: none;
-        background: white;
-        cursor: pointer;
-        font-size: 18px;
-        font-weight: bold;
-        border-top: 1px solid #ddd;
-        transition: background-color 0.2s;
-      `;
-      zoomOut.onmouseenter = () => zoomOut.style.backgroundColor = '#f0f0f0';
-      zoomOut.onmouseleave = () => zoomOut.style.backgroundColor = 'white';
-      zoomOut.onclick = () => this.zoomOut();
-    }
     _update() {
       this._layers.forEach(layer => {
         if (layer._update) layer._update();
@@ -2093,8 +2360,26 @@
       
       return this.setView(center, zoom);
     }
+    addControl(control) {
+      if (!(control instanceof Control)) {
+        throw new Error('NexusMap.addControl: control must extend Control');
+      }
+      if (this._controls.indexOf(control) === -1) {
+        this._controls.push(control);
+        control.onAdd(this);
+      }
+      return this;
+    }
+    removeControl(control) {
+      const idx = this._controls.indexOf(control);
+      if (idx > -1) {
+        this._controls.splice(idx, 1);
+        control.onRemove();
+      }
+      return this;
+    }
     addLayer(layer) {
-      if (!(layer instanceof Layer) && !(layer instanceof AttributionControl)) {
+      if (!(layer instanceof Layer)) {
         throw new Error('NexusMap.addLayer: layer must extend Layer');
       }
       if (this._layers.indexOf(layer) === -1) {
@@ -2245,9 +2530,16 @@
     Popup,
     
     // Controls
-    attributionControl: (options) => new AttributionControl(options),
+    control: {
+      zoom: (options) => new ZoomControl(options),
+      layers: (base, overlays, options) => new LayersControl(base, overlays, options),
+      attribution: (options) => new AttributionControl(options),
+    },
+    ZoomControl,
+    LayersControl,
     AttributionControl,
-    
+    Control,
+
     // Geometry
     latLng: (lat, lng, alt) => new LatLng(lat, lng, alt),
     LatLng,
